@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "inlineSourceMap": true,
+    "inlineSources": true,
+    "module": "ESNext",
+    "target": "ES2018",
+    "allowSyntheticDefaultImports": true,
+    "moduleResolution": "node",
+    "strict": true,
+    "sourceMap": false,
+    "lib": ["ES2018", "DOM"]
+  },
+  "include": ["**/*.ts"],
+  "exclude": ["node_modules"]
+}
