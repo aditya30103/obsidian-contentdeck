@@ -1,4 +1,4 @@
-import { App, Notice, Plugin, PluginSettingTab, Setting, TFile } from 'obsidian';
+import { App, normalizePath, Notice, Plugin, PluginSettingTab, Setting, TFile } from 'obsidian';
 
 // ── Types (mirroring ContentDeck's src/types) ────────────────────────────────
 
@@ -243,6 +243,7 @@ function generateMarkdown(bookmark: Bookmark): string {
 
 export default class ContentDeckPlugin extends Plugin {
   settings!: ContentDeckSettings;
+  private isSyncing = false;
 
   async onload() {
     await this.loadSettings();
@@ -266,7 +267,11 @@ export default class ContentDeckPlugin extends Plugin {
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()) as ContentDeckSettings;
+    this.settings = Object.assign(
+      {},
+      DEFAULT_SETTINGS,
+      await this.loadData(),
+    ) as ContentDeckSettings;
   }
 
   async saveSettings() {
@@ -274,6 +279,12 @@ export default class ContentDeckPlugin extends Plugin {
   }
 
   async syncBookmarks() {
+    // Guard: prevent parallel syncs from ribbon double-click
+    if (this.isSyncing) {
+      new Notice('Sync already in progress…');
+      return;
+    }
+
     const { supabaseUrl, apiToken, vaultFolder } = this.settings;
 
     if (!supabaseUrl || !apiToken || !vaultFolder) {
@@ -281,74 +292,101 @@ export default class ContentDeckPlugin extends Plugin {
       return;
     }
 
-    new Notice('Syncing ContentDeck bookmarks…');
+    this.isSyncing = true;
+    // Persistent notice (timeout=0) — updated as sync progresses
+    const progress = new Notice('Fetching bookmarks from ContentDeck…', 0);
 
-    // 1. Fetch done+unsynced bookmarks
-    let bookmarks: Bookmark[];
     try {
+      // 1. Fetch done+unsynced bookmarks
+      const baseUrl = supabaseUrl.replace(/\/$/, '');
       const res = await fetch(
-        `${supabaseUrl.replace(/\/$/, '')}/functions/v1/sync-done?token=${encodeURIComponent(apiToken)}`,
+        `${baseUrl}/functions/v1/sync-done?token=${encodeURIComponent(apiToken)}`,
       );
+
       if (!res.ok) {
-        const err = (await res.json().catch(() => ({ error: res.statusText }))) as { error?: string };
-        new Notice(`ContentDeck sync failed: ${err.error ?? res.statusText}`);
+        const err = (await res.json().catch(() => ({ error: res.statusText }))) as {
+          error?: string;
+        };
+        throw new Error(err.error ?? res.statusText);
+      }
+
+      const data = (await res.json()) as { bookmarks: Bookmark[] };
+      const bookmarks = data.bookmarks;
+
+      if (bookmarks.length === 0) {
+        progress.hide();
+        new Notice('Nothing new to sync');
         return;
       }
-      const data = (await res.json()) as { bookmarks: Bookmark[] };
-      bookmarks = data.bookmarks;
-    } catch (e) {
-      new Notice(`ContentDeck sync failed: ${e instanceof Error ? e.message : String(e)}`);
-      return;
-    }
 
-    if (bookmarks.length === 0) {
-      new Notice('Nothing new to sync');
-      return;
-    }
+      // 2. Write each bookmark as a vault note
+      const synced: string[] = [];
+      let failed = 0;
 
-    // 2. Write each bookmark as a vault note
-    const synced: string[] = [];
-    for (const bookmark of bookmarks) {
-      try {
-        await this.createOrUpdateNote(bookmark);
-        synced.push(bookmark.id);
-      } catch (e) {
-        console.error('ContentDeck: failed to write note', bookmark.id, e);
+      for (let i = 0; i < bookmarks.length; i++) {
+        const bookmark = bookmarks[i]!;
+        progress.setMessage(`Writing note ${i + 1} of ${bookmarks.length}…`);
+        try {
+          await this.createOrUpdateNote(bookmark);
+          synced.push(bookmark.id);
+        } catch (e) {
+          console.error('ContentDeck: failed to write note', bookmark.id, e);
+          failed++;
+        }
       }
-    }
 
-    // 3. Mark synced in ContentDeck
-    if (synced.length > 0) {
-      try {
-        await fetch(
-          `${supabaseUrl.replace(/\/$/, '')}/functions/v1/sync-done?token=${encodeURIComponent(apiToken)}`,
-          {
+      // 3. Mark successfully written bookmarks as synced in ContentDeck
+      if (synced.length > 0) {
+        progress.setMessage('Marking synced in ContentDeck…');
+        try {
+          await fetch(`${baseUrl}/functions/v1/sync-done?token=${encodeURIComponent(apiToken)}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ ids: synced }),
-          },
-        );
-      } catch (e) {
-        console.error('ContentDeck: failed to mark synced', e);
-        // Don't surface this — notes are already written
+          });
+        } catch (e) {
+          // Notes are already written — don't block the success notice
+          console.error('ContentDeck: failed to mark synced', e);
+        }
       }
-    }
 
-    new Notice(`Synced ${synced.length} bookmark${synced.length === 1 ? '' : 's'} from ContentDeck ✓`);
+      progress.hide();
+
+      const noun = synced.length === 1 ? 'bookmark' : 'bookmarks';
+      if (failed > 0) {
+        new Notice(`Synced ${synced.length} ${noun} (${failed} failed — check console) ✓`);
+      } else {
+        new Notice(`Synced ${synced.length} ${noun} from ContentDeck ✓`);
+      }
+    } catch (e) {
+      progress.hide();
+      new Notice(`ContentDeck sync failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      this.isSyncing = false;
+    }
   }
 
-  async createOrUpdateNote(bookmark: Bookmark) {
+  /** Create each segment of a folder path, skipping segments that already exist. */
+  private async ensureFolder(folderPath: string): Promise<void> {
+    const parts = normalizePath(folderPath).split('/').filter(Boolean);
+    let current = '';
+    for (const part of parts) {
+      current = current ? `${current}/${part}` : part;
+      if (!this.app.vault.getAbstractFileByPath(current)) {
+        await this.app.vault.createFolder(current);
+      }
+    }
+  }
+
+  async createOrUpdateNote(bookmark: Bookmark): Promise<void> {
     const { vaultFolder } = this.settings;
     const sourceFolder = getSourceFolder(bookmark.source_type);
-    const folderPath = `${vaultFolder}/${sourceFolder}`;
+    const folderPath = normalizePath(`${vaultFolder}/${sourceFolder}`);
 
-    // Ensure folder exists
-    if (!this.app.vault.getAbstractFileByPath(folderPath)) {
-      await this.app.vault.createFolder(folderPath);
-    }
+    await this.ensureFolder(folderPath);
 
     const filename = safeFilename(bookmark);
-    const filePath = `${folderPath}/${filename}`;
+    const filePath = normalizePath(`${folderPath}/${filename}`);
     const content = generateMarkdown(bookmark);
 
     const existing = this.app.vault.getAbstractFileByPath(filePath);
@@ -384,7 +422,8 @@ class ContentDeckSettingTab extends PluginSettingTab {
           .setPlaceholder('https://xyz.supabase.co')
           .setValue(this.plugin.settings.supabaseUrl)
           .onChange(async (value) => {
-            this.plugin.settings.supabaseUrl = value.trim();
+            // Normalize on save: strip trailing slash
+            this.plugin.settings.supabaseUrl = value.trim().replace(/\/$/, '');
             await this.plugin.saveSettings();
           }),
       );

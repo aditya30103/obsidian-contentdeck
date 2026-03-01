@@ -1,7 +1,7 @@
 {
   "id": "contentdeck-sync",
   "name": "ContentDeck Sync",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "minAppVersion": "1.4.0",
   "description": "Sync done bookmarks from ContentDeck into your Obsidian vault.",
   "author": "Aditya Arya",
